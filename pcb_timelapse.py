@@ -7,6 +7,8 @@ import struct
 import subprocess
 import sys
 import tempfile
+import threading
+from concurrent.futures import ThreadPoolExecutor
 
 try:
     import pcbnew
@@ -134,24 +136,25 @@ def main():
     ap.add_argument("-o", "--output", default=None)
     ap.add_argument("--duration", type=float, default=60.0, help="approximate video length in seconds (default 60)")
     ap.add_argument("--hold", type=float, default=3.0, help="hold on the final frame, seconds")
-    ap.add_argument("--steps", type=int, default=220, help="approximate number of render steps (more = smoother but slower)")
+    ap.add_argument("--steps", type=int, default=140, help="approximate number of render steps (more = smoother but slower)")
     ap.add_argument("--zoom", type=float, default=2.8, help="base camera zoom")
     ap.add_argument("--overview-every", type=int, default=16, help="on average, pull back to the overview every N steps")
     ap.add_argument("--drift", type=float, default=0.0, help="camera 'hand shake' (off by default; 0.002-0.004 if you want it)")
     ap.add_argument("--text-steps", type=int, default=90, help="total typing steps for board text (texts are typed one by one)")
-    ap.add_argument("--min-frames", type=int, default=6, help="minimum frames per step")
+    ap.add_argument("--min-frames", type=int, default=4, help="minimum frames per step")
     ap.add_argument("--seed", type=int, default=None, help="random seed (for reproducibility)")
     ap.add_argument("--no-zones", action="store_true", help="skip copper pours entirely")
     ap.add_argument("--fps", type=int, default=30)
     ap.add_argument("--width", type=int, default=1920, help="video width")
     ap.add_argument("--board-color", default="green", choices=["green", "red", "blue", "black", "white", "yellow", "purple"], help="solder mask color in the final 3D spin (default green)")
     ap.add_argument("--spin-seconds", type=float, default=6.0, help="length of the final 360 degree 3D spin, 0 disables it (default 6)")
-    ap.add_argument("--spin-frames", type=int, default=120, help="number of 3D frames rendered for the spin (more = smoother, slower)")
+    ap.add_argument("--spin-frames", type=int, default=72, help="number of 3D frames rendered for the spin (more = smoother, slower)")
     ap.add_argument("--spin-tilt", type=float, default=35.0, help="camera tilt during the spin, degrees")
     ap.add_argument("--spin-zoom", type=float, default=1.0, help="camera zoom during the spin")
     ap.add_argument("--spin-quality", default="basic", choices=["basic", "high"], help="kicad-cli 3D render quality")
     ap.add_argument("--layers", default="B.Cu,F.Cu,B.Silkscreen,F.Silkscreen,Edge.Cuts")
     ap.add_argument("--theme", default=None)
+    ap.add_argument("--cpu", action="store_true", help="disable GPU video encoder")
     ap.add_argument("--keep", action="store_true")
     args = ap.parse_args()
 
@@ -234,19 +237,39 @@ def main():
             sys.exit("kicad-cli failed to export SVG:\n" +
                      r.stderr.decode("utf-8", "replace")[-1000:])
 
+    snap_pool = ThreadPoolExecutor(max_workers=os.cpu_count() or 4)
+    clip_pool = ThreadPoolExecutor(max_workers=os.cpu_count() or 4)
+    pend = {}
+    conv_lock = threading.Lock()
+    size = [None]
+
     def snap():
-        pcb_tmp = os.path.join(tmp, "step.kicad_pcb")
+        pcb_tmp = os.path.join(tmp, f"step{counter[0]:04d}.kicad_pcb")
         svg = os.path.join(tmp, f"s{counter[0]:04d}.svg")
         png = os.path.join(tmp, f"s{counter[0]:04d}.png")
         board.Save(pcb_tmp)
-        export_svg(pcb_tmp, svg)
-        convert(svg, png)
-        os.remove(svg)
+
+        def job():
+            export_svg(pcb_tmp, svg)
+            for att in range(3):
+                try:
+                    with conv_lock:
+                        convert(svg, png)
+                    break
+                except subprocess.CalledProcessError:
+                    if att == 2:
+                        raise
+            os.remove(svg)
+            os.remove(pcb_tmp)
+        pend[png] = snap_pool.submit(job)
         counter[0] += 1
+        if size[0] is None:
+            pend[png].result()
+            size[0] = png_size(png)
         return png
 
     def geom(png):
-        pw, ph = png_size(png)
+        pw, ph = size[0]
         s = min(cw / pw, ch / ph)
         w, h = pw * s, ph * s
         return (cw - w) / 2.0, (ch - h) / 2.0, w, h
@@ -279,8 +302,24 @@ def main():
         return clamp_cam(mx, my, z)
 
     clips = []
-    enc = ["-c:v", "libx264", "-preset", "veryfast", "-crf", "18",
-           "-video_track_timescale", "90000"]
+    def pick_enc():
+        cands = [("h264_nvenc", ["-preset", "p1", "-cq", "21"]),
+                 ("h264_qsv", ["-global_quality", "21"]),
+                 ("h264_amf", ["-quality", "speed", "-qp_i", "21", "-qp_p", "21"]),
+                 ("h264_videotoolbox", ["-q:v", "65"])]
+        if not args.cpu:
+            for name, o in cands:
+                r = subprocess.run([ffmpeg, "-y", "-f", "lavfi", "-i", "color=s=640x360:d=0.2",
+                                    "-pix_fmt", "yuv420p", "-c:v", name] + o + ["-f", "null", "-"],
+                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                if r.returncode == 0:
+                    print("Encoder:", name)
+                    return ["-c:v", name] + o + ["-video_track_timescale", "90000"]
+        print("Encoder: libx264")
+        return ["-c:v", "libx264", "-preset", "ultrafast", "-crf", "20",
+                "-video_track_timescale", "90000"]
+
+    enc = pick_enc()
 
     def make_clip(png, cam0, cam1, n, move):
         idx = len(clips)
@@ -300,22 +339,11 @@ def main():
               f"pad={cw}:{ch}:(ow-iw)/2:(oh-ih)/2:color={BG_FF},"
               f"zoompan=z='{z}':x='{cx}*iw-iw/{z}/2':y='{cy}*ih-ih/{z}/2'"
               f":d={n}:s={out_w}x{out_h}:fps={fps},format=yuv420p")
-        run_ff([ffmpeg, "-y", "-i", png, "-vf", vf, "-frames:v", str(n)] + enc + [clip])
-        clips.append(clip)
-
-    def make_fade_clip(png_a, png_b, pre, fade, post):
-        idx = len(clips)
-        clip = os.path.join(tmp, f"c{idx:04d}.mp4")
-        base = (f"scale={cw}:{ch}:force_original_aspect_ratio=decrease,"
-                f"pad={cw}:{ch}:(ow-iw)/2:(oh-ih)/2:color={BG_FF},"
-                f"scale={out_w}:{out_h},setsar=1,format=yuv420p")
-        fc = (f"[0:v]{base}[a];[1:v]{base}[b];"
-              f"[a][b]xfade=transition=fade:duration={fade}:offset={pre}")
-        run_ff([ffmpeg, "-y",
-                "-loop", "1", "-framerate", str(fps), "-t", f"{pre + fade:.3f}", "-i", png_a,
-                "-loop", "1", "-framerate", str(fps), "-t", f"{fade + post:.3f}", "-i", png_b,
-                "-filter_complex", fc, "-r", str(fps)] + enc + [clip])
-        clips.append(clip)
+        def job():
+            pend[png].result()
+            run_ff([ffmpeg, "-y", "-i", png, "-vf", vf, "-frames:v", str(n)] + enc + [clip])
+            return clip
+        clips.append(clip_pool.submit(job))
 
     def nn_order(pts, jump=0.12, start=None):
         n = len(pts)
@@ -358,7 +386,7 @@ def main():
             print("\nWarning: could not set board color:", ex)
             return False
 
-    def add_spin(last_png):
+    def add_spin():
         if args.spin_seconds <= 0:
             return
         use_stackup = False
@@ -377,34 +405,44 @@ def main():
         frames = max(12, args.spin_frames)
         rate = frames / args.spin_seconds
         prj_dir = os.path.dirname(os.path.abspath(args.pcb))
-        for k in range(frames):
+        light = ["--light-camera", "0.3"]
+
+        def render(k):
             raw = os.path.join(tmp, f"raw_{k:04d}.png")
-            cmd = [cli, "pcb", "render", "--width", str(out_w), "--height", str(out_h),
-                   "--background", "transparent", "--quality", args.spin_quality,
-                   "--zoom", str(args.spin_zoom),
-                   "--rotate", f"{-args.spin_tilt:.2f},0,{360.0 * k / frames:.2f}",
-                   "-D", "KIPRJMOD=" + prj_dir, "-o", raw]
-            if use_stackup:
-                cmd.append("--use-board-stackup-colors")
-            cmd.append(final_pcb)
-            r = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-            if r.returncode != 0 or not os.path.exists(raw):
-                print("\nSkipping the 3D spin, kicad-cli pcb render failed (needs KiCad 9+):\n"
-                      + r.stderr.decode("utf-8", "replace")[-600:])
-                return
-            print(f"\r3D frame {k + 1}/{frames}", end="", flush=True)
+            for extra in (light, []):
+                cmd = [cli, "pcb", "render", "--width", str(out_w), "--height", str(out_h),
+                       "--background", "transparent", "--quality", args.spin_quality,
+                       "--zoom", str(args.spin_zoom),
+                       "--rotate", f"{-args.spin_tilt:.2f},0,{360.0 * k / frames:.2f}",
+                       "-D", "KIPRJMOD=" + prj_dir, "-o", raw] + extra
+                if use_stackup:
+                    cmd.append("--use-board-stackup-colors")
+                cmd.append(final_pcb)
+                r = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                if r.returncode == 0 and os.path.exists(raw):
+                    return None
+            return r.stderr.decode("utf-8", "replace")[-600:]
+
+        first = render(0)
+        if first:
+            print("\nSkipping the 3D spin, kicad-cli pcb render failed (needs KiCad 9+):\n" + first)
+            return
+        done_n = [1]
+        for r in clip_pool.map(render, range(1, frames)):
+            done_n[0] += 1
+            print(f"\r3D frame {done_n[0]}/{frames}", end="", flush=True)
         print()
-        flat = os.path.join(tmp, "flat_%04d.png")
+        for k in range(frames):
+            if not os.path.exists(os.path.join(tmp, f"raw_{k:04d}.png")):
+                print("\nSkipping the 3D spin, a render frame failed")
+                return
         fc = (f"[0:v]scale={out_w}:{out_h}:force_original_aspect_ratio=decrease[a];"
-              f"[1:v][a]overlay=(W-w)/2:(H-h)/2:shortest=1,format=rgb24")
-        run_ff([ffmpeg, "-y", "-framerate", f"{rate:.4f}",
-                "-i", os.path.join(tmp, "raw_%04d.png").replace("%04d", "%04d"),
-                "-f", "lavfi", "-i", f"color=c={BG_FF}:s={out_w}x{out_h}:r={rate:.4f}",
-                "-filter_complex", fc, "-start_number", "0", flat])
-        make_fade_clip(last_png, os.path.join(tmp, "flat_0000.png"), 0.1, 0.8, 0.1)
+              f"[1:v][a]overlay=(W-w)/2:(H-h)/2:shortest=1,fps={fps},format=yuv420p")
         clip = os.path.join(tmp, f"c{len(clips):04d}.mp4")
-        run_ff([ffmpeg, "-y", "-framerate", f"{rate:.4f}", "-i", flat,
-                "-vf", f"fps={fps},format=yuv420p"] + enc + [clip])
+        run_ff([ffmpeg, "-y", "-framerate", f"{rate:.4f}",
+                "-i", os.path.join(tmp, "raw_%04d.png"),
+                "-f", "lavfi", "-i", f"color=c={BG_FF}:s={out_w}x{out_h}:r={rate:.4f}",
+                "-filter_complex", fc] + enc + [clip])
         clips.append(clip)
 
     S = max(20, args.steps)
@@ -505,12 +543,23 @@ def main():
                 steps.append({"phase": "text", "w": 0.5, "pts": [tp[j]],
                               "fn": make_type(t, s, L, qi == 0)})
 
-    zone_groups = []
     if zones:
         gs = max(1, math.ceil(len(zones) / 5))
-        zone_groups = [zones[i:i + gs] for i in range(0, len(zones), gs)]
-        for zg in zone_groups:
-            steps.append({"zone": True, "phase": "zone", "zs": zg})
+        ctr = (bx + bw / 2.0, by + bh / 2.0)
+
+        def make_zone(zg):
+            def fn():
+                for z in zg:
+                    board.Add(z)
+                try:
+                    pcbnew.ZONE_FILLER(board).Fill(board.Zones())
+                except Exception as ex:
+                    print("\nWarning: failed to fill zones:", ex)
+            return fn
+
+        for i in range(0, len(zones), gs):
+            steps.append({"phase": "zone", "w": 3.0, "pts": [ctr], "ov": True,
+                          "fn": make_zone(zones[i:i + gs])})
 
     if ref_idx:
         rp = []
@@ -535,10 +584,9 @@ def main():
                           "pts": [rp[j] for j in sel],
                           "fn": make_reveal([ref_idx[j] for j in sel])})
 
-    normal = [s for s in steps if not s.get("zone")]
+    normal = steps
     nsteps = len(normal)
-    zone_cost = 1.9 * len(zone_groups)
-    body_sec = max(8.0, args.duration - args.hold - 1.0 - 1.5 - zone_cost)
+    body_sec = max(8.0, args.duration - args.hold - 1.0 - 1.5)
     body_frames = int(fps * body_sec)
 
     for s in normal:
@@ -564,30 +612,13 @@ def main():
     done = 0
 
     for s in steps:
-        if s.get("zone"):
-            if cam != OV:
-                make_clip(png, cam, OV, int(1.2 * fps), int(1.0 * fps))
-            cam = OV
-            for z in s["zs"]:
-                board.Add(z)
-            try:
-                pcbnew.ZONE_FILLER(board).Fill(board.Zones())
-            except Exception as ex:
-                print("\nWarning: failed to fill zones:", ex)
-            png2 = snap()
-            make_fade_clip(png, png2, 0.2, 1.3, 0.4)
-            png = png2
-            last_phase = "zone"
-            since_ov = 0
-            continue
-
         s["fn"]()
         png = snap()
         g = geom(png)
         n = s["n"]
 
-        force_ov = done > 0 and (s["phase"] != last_phase or since_ov >= next_ov)
-        if force_ov and last_phase != "zone":
+        force_ov = s.get("ov") or (done > 0 and (s["phase"] != last_phase or since_ov >= next_ov))
+        if force_ov:
             new = OV
             since_ov = 0
             next_ov = max(3, int(args.overview_every * rnd.uniform(0.6, 1.4)))
@@ -608,11 +639,17 @@ def main():
 
     move_final = int(1.5 * fps)
     make_clip(png, cam, OV, move_final + int(args.hold * fps), move_final)
-    add_spin(png)
+    for i, c in enumerate(clips):
+        if hasattr(c, "result"):
+            c.result()
+        print(f"\rencoding {i + 1}/{len(clips)}", end="", flush=True)
+    print()
+    add_spin()
 
     lst = os.path.join(tmp, "list.txt")
     with open(lst, "w", encoding="utf-8") as f:
         for c in clips:
+            c = c.result() if hasattr(c, "result") else c
             f.write("file '" + c.replace("\\", "/") + "'\n")
     run_ff([ffmpeg, "-y", "-f", "concat", "-safe", "0", "-i", lst, "-c", "copy", out])
 
