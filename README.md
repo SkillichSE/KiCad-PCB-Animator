@@ -1,7 +1,7 @@
 # pcb_timelapse
 
 
-https://github.com/user-attachments/assets/fd2a5344-ad6f-4221-9a66-6f0b68b4ddc0
+<img width="480" height="270" alt="soma" src="https://github.com/user-attachments/assets/3a769852-3ff8-4202-aeed-cdd726d28309" />
 
 
 Builds a human-looking "routing timelapse" video from a finished `.kicad_pcb`.
@@ -59,3 +59,6 @@ python3 pcb_timelapse_v4.py board.kicad_pcb -o board.mp4
 - A fast test run: `--steps 60 --duration 20 --width 1280 --seed 1`.
 - The 3D spin uses `kicad-cli pcb render`; if it fails, the video is still produced without the spin.
 - Rendering takes a while: every step is a separate `kicad-cli` export.
+
+https://github.com/user-attachments/assets/fd2a5344-ad6f-4221-9a66-6f0b68b4ddc0
+
