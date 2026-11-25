@@ -138,11 +138,18 @@ def main():
     ap.add_argument("--zoom", type=float, default=2.8, help="base camera zoom")
     ap.add_argument("--overview-every", type=int, default=16, help="on average, pull back to the overview every N steps")
     ap.add_argument("--drift", type=float, default=0.0, help="camera 'hand shake' (off by default; 0.002-0.004 if you want it)")
+    ap.add_argument("--text-steps", type=int, default=90, help="total typing steps for board text (texts are typed one by one)")
     ap.add_argument("--min-frames", type=int, default=6, help="minimum frames per step")
     ap.add_argument("--seed", type=int, default=None, help="random seed (for reproducibility)")
     ap.add_argument("--no-zones", action="store_true", help="skip copper pours entirely")
     ap.add_argument("--fps", type=int, default=30)
     ap.add_argument("--width", type=int, default=1920, help="video width")
+    ap.add_argument("--board-color", default="green", choices=["green", "red", "blue", "black", "white", "yellow", "purple"], help="solder mask color in the final 3D spin (default green)")
+    ap.add_argument("--spin-seconds", type=float, default=6.0, help="length of the final 360 degree 3D spin, 0 disables it (default 6)")
+    ap.add_argument("--spin-frames", type=int, default=120, help="number of 3D frames rendered for the spin (more = smoother, slower)")
+    ap.add_argument("--spin-tilt", type=float, default=35.0, help="camera tilt during the spin, degrees")
+    ap.add_argument("--spin-zoom", type=float, default=1.0, help="camera zoom during the spin")
+    ap.add_argument("--spin-quality", default="basic", choices=["basic", "high"], help="kicad-cli 3D render quality")
     ap.add_argument("--layers", default="B.Cu,F.Cu,B.Silkscreen,F.Silkscreen,Edge.Cuts")
     ap.add_argument("--theme", default=None)
     ap.add_argument("--keep", action="store_true")
@@ -328,6 +335,78 @@ def main():
             rest.discard(cur)
         return out
 
+    mask_names = {"green": "Green", "red": "Red", "blue": "Blue", "black": "Black",
+                  "white": "White", "yellow": "Yellow", "purple": "Purple"}
+
+    def apply_board_color(name):
+        try:
+            ds = board.GetDesignSettings()
+            sd = ds.GetStackupDescriptor()
+            if not list(sd.GetList()):
+                sd.BuildDefaultStackupList(ds, board.GetCopperLayerCount())
+            try:
+                ds.m_HasStackup = True
+            except Exception:
+                pass
+            hit = False
+            for item in sd.GetList():
+                if item.GetType() == pcbnew.BS_ITEM_TYPE_SOLDERMASK:
+                    item.SetColor(mask_names[name])
+                    hit = True
+            return hit
+        except Exception as ex:
+            print("\nWarning: could not set board color:", ex)
+            return False
+
+    def add_spin(last_png):
+        if args.spin_seconds <= 0:
+            return
+        use_stackup = False
+        if args.board_color != "green":
+            use_stackup = apply_board_color(args.board_color)
+            if not use_stackup:
+                print("Falling back to the default green board")
+        for d in list(board.GetDrawings()):
+            try:
+                if d.GetLayer() == pcbnew.Cmts_User:
+                    board.Remove(d)
+            except Exception:
+                pass
+        final_pcb = os.path.join(tmp, "final.kicad_pcb")
+        board.Save(final_pcb)
+        frames = max(12, args.spin_frames)
+        rate = frames / args.spin_seconds
+        prj_dir = os.path.dirname(os.path.abspath(args.pcb))
+        for k in range(frames):
+            raw = os.path.join(tmp, f"raw_{k:04d}.png")
+            cmd = [cli, "pcb", "render", "--width", str(out_w), "--height", str(out_h),
+                   "--background", "transparent", "--quality", args.spin_quality,
+                   "--zoom", str(args.spin_zoom),
+                   "--rotate", f"{-args.spin_tilt:.2f},0,{360.0 * k / frames:.2f}",
+                   "-D", "KIPRJMOD=" + prj_dir, "-o", raw]
+            if use_stackup:
+                cmd.append("--use-board-stackup-colors")
+            cmd.append(final_pcb)
+            r = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            if r.returncode != 0 or not os.path.exists(raw):
+                print("\nSkipping the 3D spin, kicad-cli pcb render failed (needs KiCad 9+):\n"
+                      + r.stderr.decode("utf-8", "replace")[-600:])
+                return
+            print(f"\r3D frame {k + 1}/{frames}", end="", flush=True)
+        print()
+        flat = os.path.join(tmp, "flat_%04d.png")
+        fc = (f"[0:v]scale={out_w}:{out_h}:force_original_aspect_ratio=decrease[a];"
+              f"[1:v][a]overlay=(W-w)/2:(H-h)/2:shortest=1,format=rgb24")
+        run_ff([ffmpeg, "-y", "-framerate", f"{rate:.4f}",
+                "-i", os.path.join(tmp, "raw_%04d.png").replace("%04d", "%04d"),
+                "-f", "lavfi", "-i", f"color=c={BG_FF}:s={out_w}x{out_h}:r={rate:.4f}",
+                "-filter_complex", fc, "-start_number", "0", flat])
+        make_fade_clip(last_png, os.path.join(tmp, "flat_0000.png"), 0.1, 0.8, 0.1)
+        clip = os.path.join(tmp, f"c{len(clips):04d}.mp4")
+        run_ff([ffmpeg, "-y", "-framerate", f"{rate:.4f}", "-i", flat,
+                "-vf", f"fps={fps},format=yuv420p"] + enc + [clip])
+        clips.append(clip)
+
     S = max(20, args.steps)
     steps = []
 
@@ -403,6 +482,29 @@ def main():
             steps.append({"phase": "track", "w": 0.7 * math.sqrt(len(its)),
                           "pts": pts, "fn": make_add(its)})
 
+    if texts:
+        tp = [item_pos(t) for t in texts]
+        order_t = nn_order(tp, 0.05)
+        budget = max(len(texts), args.text_steps)
+        per = max(2, min(8, budget // len(texts)))
+
+        def make_type(t, s, L, first):
+            def fn():
+                t.SetText(s[:L])
+                if first:
+                    board.Add(t)
+            return fn
+
+        for j in order_t:
+            t = texts[j]
+            s = t.GetText()
+            n = len(s)
+            kk = min(per, n)
+            lens = sorted(set(max(1, math.ceil(n * (q + 1) / kk)) for q in range(kk)))
+            for qi, L in enumerate(lens):
+                steps.append({"phase": "text", "w": 0.5, "pts": [tp[j]],
+                              "fn": make_type(t, s, L, qi == 0)})
+
     zone_groups = []
     if zones:
         gs = max(1, math.ceil(len(zones) / 5))
@@ -432,29 +534,6 @@ def main():
             steps.append({"phase": "label", "w": 0.6 * math.sqrt(len(sel)),
                           "pts": [rp[j] for j in sel],
                           "fn": make_reveal([ref_idx[j] for j in sel])})
-
-    if texts:
-        tp = [item_pos(t) for t in texts]
-        order_t = nn_order(tp, 0.05)
-        stages = 5
-        nb = max(1, int(S * 0.15) // stages)
-        bsz = max(1, math.ceil(len(order_t) / nb))
-
-        def make_type(batch, q):
-            def fn():
-                for t, s in batch:
-                    L = max(1, math.ceil(len(s) * (q + 1) / stages))
-                    t.SetText(s[:L])
-                    if q == 0:
-                        board.Add(t)
-            return fn
-
-        for i in range(0, len(order_t), bsz):
-            ids = order_t[i:i + bsz]
-            batch = [(texts[j], texts[j].GetText()) for j in ids]
-            for q in range(stages):
-                steps.append({"phase": "text", "w": 0.9, "pts": [tp[j] for j in ids],
-                              "fn": make_type(batch, q)})
 
     normal = [s for s in steps if not s.get("zone")]
     nsteps = len(normal)
@@ -529,6 +608,7 @@ def main():
 
     move_final = int(1.5 * fps)
     make_clip(png, cam, OV, move_final + int(args.hold * fps), move_final)
+    add_spin(png)
 
     lst = os.path.join(tmp, "list.txt")
     with open(lst, "w", encoding="utf-8") as f:
