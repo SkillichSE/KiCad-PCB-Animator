@@ -1,6 +1,6 @@
-# pcb_timelapse
+# PCB Animator
 
-Builds a human-looking "routing timelapse" video from a finished `.kicad_pcb`.
+Builds a timelapse video from a finished `.kicad_pcb`.
 
 ## Requirements
 
