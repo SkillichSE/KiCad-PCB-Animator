@@ -1,5 +1,9 @@
 # pcb_timelapse
 
+
+https://github.com/user-attachments/assets/fd2a5344-ad6f-4221-9a66-6f0b68b4ddc0
+
+
 Builds a human-looking "routing timelapse" video from a finished `.kicad_pcb`.
 
 ## Requirements
